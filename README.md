@@ -8,12 +8,12 @@ Terraform to deploy it to AWS on a free-tier-safe footprint.
 **What I'd do differently with more time:** run a real 3-broker Kafka
 cluster with actual replication instead of single-broker KRaft, so
 broker-failure recovery is something this repo actually tests instead of
-assumes; replace the hand-rolled load generator with a real tool (k6 or
-vegeta) — debugging my own test client's throughput ceiling, not the
-pipeline's, cost real time during benchmarking (see
-[Benchmarks](#benchmarks)); and wire DLQ volume to an actual alert
-(Slack/PagerDuty) instead of a log line, since a hook point existing isn't
-the same as someone getting paged.
+assumes (the chaos testing below kills a *consumer*, not the broker itself);
+extend [chaos testing](#chaos-testing-proving-fault-tolerance-instead-of-asserting-it)
+to network partitions and slow-disk scenarios, not just a hard process
+kill; and wire DLQ volume to an actual alert (Slack/PagerDuty) instead of a
+log line, since a hook point existing isn't the same as someone getting
+paged.
 
 ## Architecture
 
@@ -59,6 +59,11 @@ idempotency check — one pipelined round trip per poll batch, not one per
 event. This is what actually moved the latency and throughput numbers below
 (see [Benchmarks](#benchmarks)); Kafka itself was never the bottleneck.
 
+The API also serializes responses with `orjson` (`ORJSONResponse` as
+FastAPI's default response class) instead of stdlib `json` - it handles
+`UUID`/`datetime` natively and is a well-established faster default for
+exactly the asyncpg-`Record`-to-JSON responses this API returns.
+
 The trade-off: `GET /events/{id}` is eventually consistent. Right after a
 `POST /events` returns 202, the event may not be queryable yet (404) until
 the consumer catches up - typically tens of milliseconds, but not
@@ -80,12 +85,15 @@ scale horizontally here.
   (`asyncio.gather`, bounded by a semaphore) instead of sequentially. See
   [Benchmarks](#benchmarks) for the measured reduction vs. a synchronous baseline.
 - **Fault-tolerant retry, persistence, monitoring, failure-recovery** —
-  `src/common/retry.py` (exponential backoff + a circuit breaker),
-  `events.dlq` + `src/consumer/dlq_consumer.py` (dead-letter queue with an audit
-  trail in `dead_letter_log`), Redis-backed idempotency so Kafka's at-least-once
-  delivery doesn't double-process on redelivery, and Prometheus metrics
+  `src/common/retry.py` (exponential backoff + a circuit breaker actually
+  wired into the Postgres write path), `events.dlq` + `src/consumer/dlq_consumer.py`
+  (dead-letter queue with an audit trail in `dead_letter_log`), Redis-backed
+  idempotency so Kafka's at-least-once delivery doesn't double-process on
+  redelivery, graceful shutdown, and Prometheus metrics
   (`events_processed_total`, `events_failed_total`, `events_dead_lettered_total`,
-  `event_processing_latency_seconds`) exposed by every service.
+  `db_write_failures_total`, `event_processing_latency_seconds`) exposed by
+  every service. Not just implemented - actually chaos-tested; see
+  [Chaos testing](#chaos-testing-proving-fault-tolerance-instead-of-asserting-it).
 
 ## Quickstart (local, $0, no AWS account needed)
 
@@ -217,6 +225,57 @@ only 1 partition, which meant scaling consumer replicas did nothing.
   downstream dependency, a poison-pill message, a full disk) will behave
   differently than a coin flip in `processor.py`.
 
+## Chaos testing: proving fault tolerance instead of asserting it
+
+Most "fault-tolerant" claims in a README are backed by code that's never
+actually been made to fail. `scripts/chaos_test.py` does the opposite:
+with 3 consumer replicas running, it starts a sustained batch of events,
+mid-run sends `SIGKILL` (not a graceful stop — a hard, no-warning crash) to
+one live replica, then independently verifies the partitions got
+reassigned, every single event still lands in Postgres, and nothing else
+broke.
+
+```bash
+docker compose up -d --build --scale consumer=3
+PYTHONPATH=. python3 scripts/chaos_test.py --total 20000 --kill-at 5000
+```
+
+**The first two runs of this failed**, and both failures were real bugs,
+not test flakiness:
+
+1. **1 of 20,000 events silently lost.** Root cause: the consumer claimed
+   an event's Redis idempotency key *before* processing and persisting it,
+   not after. The killed replica had claimed the key, then died before its
+   Postgres write committed. The redelivered message was skipped by the
+   survivor as "already done" - except it never actually was. Fix: claim
+   the idempotency key only *after* a successful, durable Postgres write
+   (`src/redis_client.py::claim_processed_batch`, called post-persist in
+   `src/consumer/consumer.py`), with a read-only check beforehand
+   (`check_already_processed_batch`) to decide whether to skip reprocessing.
+2. **Killing one replica crashed a second, unrelated one.** Any member
+   dying triggers a group-wide rebalance for *every* consumer, not just
+   reassignment of the dead one's partitions. A healthy replica's in-flight
+   `consumer.commit()` landed mid-rebalance and raised
+   `CommitFailedError`, which was unhandled and killed the process. Fix:
+   `commit_tolerantly()` in `src/consumer/consumer.py` catches this
+   specific, expected-under-rebalance failure and logs it instead of
+   crashing - safe to ignore because the batch's outcomes are already
+   durably written and idempotency-claimed by that point, so a redelivery
+   is either a no-op or picked up cleanly by whoever now owns the partition.
+
+**Third run, after both fixes** (20,000 events, kill at event #5,000):
+
+```
+Events sent: 20000
+Events recovered in Postgres: 20000 (dead-lettered: 0)
+Data loss: NONE
+Time to reassign dead replica's partitions: 1.5s
+Time to fully drain after the kill: 0.0s
+```
+
+The killed replica exited 137 (SIGKILL) as expected; the two survivors
+stayed up throughout (verified via `docker compose ps -a`).
+
 ## Fault tolerance in detail
 
 - **Retries**: `src/common/retry.py::retry_with_backoff` — exponential backoff
@@ -226,16 +285,28 @@ only 1 partition, which meant scaling consumer replicas did nothing.
   `events.dlq`, the source row in `events` is marked `dead_letter`, and a
   separate `dlq-consumer` service persists an immutable audit record to
   `dead_letter_log` — the natural hook point for paging/alerting.
-- **Idempotency**: Kafka only guarantees at-least-once delivery; a consumer
-  crash after processing but before committing an offset will redeliver a
-  message. `src/redis_client.py::mark_processed_if_new` uses `SET NX EX` to
-  claim an event id exactly once, making reprocessing a no-op — this is what
-  turns "at least once" into "effectively once" without needing a
-  transactional outbox.
-- **Circuit breaker**: `src/common/retry.py::CircuitBreaker` is available for
-  wrapping calls to a downstream dependency that's failing consistently
-  (rather than transiently), to fail fast instead of retrying into a
-  degraded system.
+- **Idempotency, claimed after persistence, not before**: Kafka only
+  guarantees at-least-once delivery, so a crash between processing and
+  committing an offset will redeliver a message. `src/redis_client.py`
+  splits this into a read-only `check_already_processed_batch` (before
+  processing) and `claim_processed_batch` (only after a successful,
+  durable Postgres write) - claiming any earlier reintroduces the exact
+  data-loss bug the chaos test above caught and fixed.
+- **Circuit breaker, actually wired in**: `src/common/retry.py::CircuitBreaker`
+  guards the batched Postgres write in `src/consumer/consumer.py::flush_to_postgres`
+  - opens after 3 consecutive failures, fails fast for 10s instead of
+  letting every poll cycle hang on a dead connection pool, and retries
+  indefinitely (applying backpressure to that replica) rather than ever
+  silently dropping a batch. Verified by stopping the Postgres container
+  mid-load: the consumer logged backoff attempts, the breaker opened, and
+  every event was recovered with zero loss once Postgres came back.
+- **Graceful shutdown**: `src/consumer/consumer.py` installs a SIGTERM/SIGINT
+  handler that lets an in-flight poll batch finish (process, persist,
+  claim, commit) before exiting, instead of abandoning it mid-flight.
+  Requires running the container in exec form (`command: ["python", ...]`
+  in `docker-compose.yml`, not a shell string), since a shell-wrapped
+  command doesn't forward SIGTERM to the process inside it - an easy thing
+  to get wrong silently, so worth calling out.
 
 ## Monitoring
 
@@ -243,6 +314,7 @@ Every service (`api`, each `consumer` replica, `dlq-consumer`) exposes
 Prometheus metrics. Key series: `events_produced_total`,
 `events_processed_total`, `events_failed_total`,
 `events_dead_lettered_total`, `events_duplicate_total` (idempotency hits),
+`db_write_failures_total` (circuit-breaker-guarded Postgres write retries),
 `event_processing_latency_seconds` (histogram), `events_in_flight`.
 `monitoring/prometheus.yml` wires up scraping for the default (unscaled)
 compose topology; horizontally scaling monitoring past a single consumer
@@ -294,6 +366,8 @@ scripts/
   generate_load.py       Realistic end-to-end load generator (via the REST API)
   capacity_test.py       Consumer pipeline sustained-throughput test, isolated
                           from the load generator's own limits
+  chaos_test.py          Kills a live consumer replica under load, proves
+                          zero data loss - see Chaos testing above
 infra/                   Terraform for the free-tier AWS deployment
 migrations/001_init.sql  Postgres schema
 ```

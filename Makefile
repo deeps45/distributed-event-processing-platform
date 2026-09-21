@@ -1,4 +1,4 @@
-.PHONY: up down logs scale-consumers load benchmark test
+.PHONY: up down logs scale-consumers load benchmark capacity-test chaos-test test
 
 up:
 	docker compose up -d --build
@@ -20,6 +20,11 @@ benchmark:
 
 capacity-test:
 	PYTHONPATH=. python3 scripts/capacity_test.py --total 50000 --concurrency 200
+
+# Needs at least 2 consumer replicas (docker compose up -d --scale consumer=3)
+# so killing one still leaves survivors to take over its partitions.
+chaos-test:
+	PYTHONPATH=. python3 scripts/chaos_test.py --total 20000 --kill-at 5000
 
 test:
 	pytest -q

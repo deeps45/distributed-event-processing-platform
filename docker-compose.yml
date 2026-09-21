@@ -81,7 +81,10 @@ services:
 
   api:
     build: .
-    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+    # List (exec) form, not a shell string: with a plain string, Docker
+    # wraps it as `/bin/sh -c "..."`, so the shell is PID 1 and doesn't
+    # forward SIGTERM to uvicorn. This form runs uvicorn as PID 1 directly.
+    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
     environment: *app-env
@@ -95,8 +98,13 @@ services:
 
   consumer:
     build: .
-    command: python -m src.consumer.consumer
+    # Same exec-form reasoning as api - and it matters more here: consumer.py
+    # installs its own SIGTERM handler to drain in-flight work before
+    # exiting (see src/consumer/consumer.py), which only fires if the
+    # signal actually reaches the Python process.
+    command: ["python", "-m", "src.consumer.consumer"]
     environment: *app-env
+    stop_grace_period: 30s
     depends_on:
       kafka:
         condition: service_healthy
@@ -107,7 +115,7 @@ services:
 
   dlq-consumer:
     build: .
-    command: python -m src.consumer.dlq_consumer
+    command: ["python", "-m", "src.consumer.dlq_consumer"]
     environment: *app-env
     depends_on:
       kafka:

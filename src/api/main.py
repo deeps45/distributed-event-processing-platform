@@ -3,7 +3,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import ORJSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from src import db
@@ -29,7 +29,15 @@ async def lifespan(app: FastAPI):
     await db.close_pool()
 
 
-app = FastAPI(title="Distributed Event Processing Platform", lifespan=lifespan)
+app = FastAPI(
+    title="Distributed Event Processing Platform",
+    lifespan=lifespan,
+    # orjson serializes UUID/datetime natively and is measurably faster
+    # than stdlib json for the dict-of-asyncpg-Record responses this API
+    # returns - the default response class for every endpoint below,
+    # not just a one-off.
+    default_response_class=ORJSONResponse,
+)
 
 
 @app.post("/events", status_code=202)
@@ -84,7 +92,7 @@ async def health():
         logger.exception("redis health check failed")
 
     healthy = all(checks.values())
-    return JSONResponse(
+    return ORJSONResponse(
         content={"healthy": healthy, "checks": checks},
         status_code=200 if healthy else 503,
     )

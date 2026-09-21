@@ -27,3 +27,8 @@ CONSUMER_LAG = Gauge(
 )
 
 IN_FLIGHT_EVENTS = Gauge("events_in_flight", "Events currently being processed by this consumer instance")
+
+DB_WRITE_FAILURES = Counter(
+    "db_write_failures_total",
+    "Failed attempts to flush a batch to Postgres (retried with backpressure - see consumer.py)",
+)
