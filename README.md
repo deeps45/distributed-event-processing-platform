@@ -5,6 +5,16 @@ a REST ingestion API, Redis-backed idempotency, Postgres persistence, Prometheus
 monitoring, and a dead-letter queue for failure recovery — all containerized, with
 Terraform to deploy it to AWS on a free-tier-safe footprint.
 
+**What I'd do differently with more time:** run a real 3-broker Kafka
+cluster with actual replication instead of single-broker KRaft, so
+broker-failure recovery is something this repo actually tests instead of
+assumes; replace the hand-rolled load generator with a real tool (k6 or
+vegeta) — debugging my own test client's throughput ceiling, not the
+pipeline's, cost real time during benchmarking (see
+[Benchmarks](#benchmarks)); and wire DLQ volume to an actual alert
+(Slack/PagerDuty) instead of a log line, since a hook point existing isn't
+the same as someone getting paged.
+
 ## Architecture
 
 ```
