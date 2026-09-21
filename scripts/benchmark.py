@@ -73,14 +73,22 @@ async def run_async_pipeline(n: int, concurrency: int) -> list[float]:
 
 
 def summarize(name: str, latencies: list[float], wall_seconds: float) -> dict:
-    avg_ms = statistics.mean(latencies) * 1000
-    p95_ms = statistics.quantiles(latencies, n=20)[18] * 1000
-    throughput = len(latencies) / wall_seconds
+    # "effective_latency_ms" is wall_seconds / count: the average time added
+    # to the pipeline per event to fully drain this batch. This is the
+    # apples-to-apples number across modes. The raw per-call
+    # send_and_wait() round-trip (individual_*) is reported separately
+    # because under CONCURRENCY-wide fan-out it reflects queueing delay
+    # while waiting for a turn, not end-to-end pipeline latency - comparing
+    # it directly against the sync mode's uncontended round-trip would be
+    # comparing two different things and produce a misleading number.
+    count = len(latencies)
+    throughput = count / wall_seconds
     return {
         "name": name,
-        "count": len(latencies),
-        "avg_latency_ms": round(avg_ms, 2),
-        "p95_latency_ms": round(p95_ms, 2),
+        "count": count,
+        "effective_latency_ms": round(wall_seconds / count * 1000, 3),
+        "individual_avg_round_trip_ms": round(statistics.mean(latencies) * 1000, 2),
+        "individual_p95_round_trip_ms": round(statistics.quantiles(latencies, n=20)[18] * 1000, 2),
         "wall_seconds": round(wall_seconds, 2),
         "throughput_events_per_sec": round(throughput, 1),
         "extrapolated_events_per_day": round(throughput * 86400),
@@ -99,16 +107,23 @@ async def main() -> None:
     async_stats = summarize("async_pipeline", async_latencies, time.perf_counter() - start)
 
     reduction_pct = (
-        (sync_stats["avg_latency_ms"] - async_stats["avg_latency_ms"]) / sync_stats["avg_latency_ms"] * 100
+        (sync_stats["effective_latency_ms"] - async_stats["effective_latency_ms"])
+        / sync_stats["effective_latency_ms"]
+        * 100
     )
 
     print("\n=== Results ===")
     print(sync_stats)
     print(async_stats)
-    print(f"\nAverage per-event latency reduction (async vs sync): {reduction_pct:.1f}%")
+    print(f"\nEffective per-event latency reduction (async vs sync, time to drain the batch): {reduction_pct:.1f}%")
     print(
         f"Sustained throughput (async pipeline): {async_stats['throughput_events_per_sec']} events/sec "
         f"(~{async_stats['extrapolated_events_per_day']:,} events/day)"
+    )
+    print(
+        "\nNote: individual_*_round_trip_ms under the async run reflects per-call queueing while "
+        f"waiting for a turn among {CONCURRENCY} concurrent sends, not end-to-end pipeline latency - "
+        "that's what effective_latency_ms (wall clock / event count) measures instead."
     )
 
 

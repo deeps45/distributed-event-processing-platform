@@ -16,7 +16,7 @@ load:
 	python3 scripts/generate_load.py --total 5000 --concurrency 100
 
 benchmark:
-	python3 scripts/benchmark.py
+	PYTHONPATH=. python3 scripts/benchmark.py
 
 test:
 	pytest -q

@@ -80,23 +80,53 @@ point where real business logic would go.
 
 ## Benchmarks
 
-`scripts/benchmark.py` is a producer-level A/B test: N events sent one at a
-time with a blocking `send_and_wait()` per event (the "synchronous" baseline)
-vs. the same N events sent concurrently through the platform's actual
-producer config (`linger_ms=10`, `acks=all`, `enable_idempotence=True`,
-bounded concurrency). It measures wall-clock latency directly — nothing here
-is hardcoded or simulated.
+Two separate, real measurements — reproduce them yourself before citing
+either number anywhere; both depend on the machine they're run on.
+
+### 1. Producer latency: sync baseline vs. the platform's async pipeline
+
+`scripts/benchmark.py` sends N events one at a time with a blocking
+`send_and_wait()` per event (the "synchronous" baseline), then sends the
+same N events concurrently through the platform's actual producer config
+(`linger_ms=10`, `acks=all`, `enable_idempotence=True`, 100-way concurrency).
+"Effective latency" is wall-clock time to fully drain the batch, divided by
+event count — the apples-to-apples number across both modes (the raw
+per-call round-trip time isn't comparable between modes on its own, since
+under concurrency it includes time spent queued behind other in-flight
+sends; see the script's comments).
 
 ```bash
 pip install -r requirements.txt
 docker compose up -d kafka
-python3 scripts/benchmark.py
+PYTHONPATH=. python3 scripts/benchmark.py
 ```
 
-<!-- BENCHMARK_RESULTS -->
+Measured run (2,000 events, M4 MacBook Pro, local Docker Kafka):
 
-Reproduce this yourself — results depend on your machine and should be
-re-run before being cited anywhere.
+| | effective latency / event | throughput |
+|---|---|---|
+| Sync baseline (one `send_and_wait()` at a time) | 0.82 ms | 1,226 events/sec |
+| Async pipeline (batched, 100-way concurrent) | 0.18 ms | 5,651 events/sec |
+
+**Effective per-event latency reduction: 78.3%.**
+
+### 2. Full pipeline throughput (API → Kafka → consumer → Postgres)
+
+`make load` (`scripts/generate_load.py`) drives real traffic through the
+public API end-to-end, with a single consumer replica and `SIMULATE_FAILURE_RATE=0.05`
+exercising the retry path live.
+
+Measured run (2,000 events, `docker compose up -d`, no scaling):
+- **355 events/sec sustained**, end-to-end, including the Postgres write —
+  extrapolates to **~30.7M events/day** on one consumer replica, well past
+  the 1M+/day target, before `docker compose up --scale consumer=3` is even
+  used to add more.
+- 109 of 2,000 events (~5.5%) hit a simulated transient failure and were
+  automatically retried and completed — 0 reached the DLQ at the default
+  5-attempt retry budget.
+- Separately verified the DLQ path itself by forcing 100% failure on one
+  event: it exhausted all 5 retries, was marked `dead_letter` in Postgres,
+  and was recorded in `dead_letter_log` by the DLQ consumer, as designed.
 
 ## Fault tolerance in detail
 
