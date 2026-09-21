@@ -1,0 +1,6 @@
+aws_region       = "us-east-1"
+instance_type    = "t3.micro"
+key_name         = "your-ec2-keypair-name"
+allowed_ssh_cidr = "YOUR_IP/32"
+allowed_app_cidr = "YOUR_IP/32"
+github_repo_url  = "https://github.com/deeps45/distributed-event-processing-platform.git"
