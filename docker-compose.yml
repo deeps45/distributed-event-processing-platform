@@ -37,6 +37,12 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Auto-created topics (events, events.dlq) get 6 partitions instead of
+      # the default 1, so `docker compose up --scale consumer=N` for N up to
+      # 6 actually distributes work across replicas instead of leaving
+      # extras idle - a single partition can only be consumed by one
+      # consumer per group at a time.
+      KAFKA_NUM_PARTITIONS: 6
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:

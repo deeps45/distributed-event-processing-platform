@@ -18,5 +18,8 @@ load:
 benchmark:
 	PYTHONPATH=. python3 scripts/benchmark.py
 
+capacity-test:
+	PYTHONPATH=. python3 scripts/capacity_test.py --total 50000 --concurrency 200
+
 test:
 	pytest -q

@@ -7,10 +7,12 @@ from pydantic import BaseModel, Field
 
 
 class EventStatus(str, Enum):
-    PENDING = "pending"
-    PROCESSING = "processing"
+    """The only two states ever persisted to Postgres - see
+    src/consumer/consumer.py. Retries happen in-process before either of
+    these is written, so there's no "pending"/"processing"/"retrying" row
+    state to track; an event id with no row yet is just not done."""
+
     COMPLETED = "completed"
-    RETRYING = "retrying"
     DEAD_LETTER = "dead_letter"
 
 

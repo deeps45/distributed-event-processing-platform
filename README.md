@@ -11,27 +11,51 @@ Terraform to deploy it to AWS on a free-tier-safe footprint.
                  ┌─────────────┐
   HTTP POST ───▶ │   FastAPI   │──────┐
   /events        │  (api)      │      │  produce (async, batched, acks=all)
-                 └──────┬──────┘      ▼
-                        │        ┌─────────┐
-                 insert │        │  Kafka  │
-                 pending│        │ (events)│
-                        ▼        └────┬────┘
-                 ┌─────────────┐      │ consume (concurrent, manual commit)
-                 │  PostgreSQL │      ▼
-                 │  (events,   │ ┌──────────────┐     idempotency check
-                 │ dead_letter │◀│   Consumer   │◀──── (Redis SETNX)
-                 │    _log)    │ │ (N replicas) │
+                 └─────────────┘      ▼           no DB write here - see below
+                                  ┌─────────┐
+                                  │  Kafka  │  6 partitions
+                                  │ (events)│
+                                  └────┬────┘
+                                       │ consume (concurrent, manual commit)
+                                       ▼
+                 ┌─────────────┐ ┌──────────────┐     idempotency check,
+                 │  PostgreSQL │◀│   Consumer   │◀──── batched (Redis pipeline,
+                 │  (events,   │ │ (N replicas, │      SETNX per key)
+                 │ dead_letter │ │ 2 partitions │
+                 │    _log)    │ │  each @N=3)  │
                  └─────────────┘ └──────┬───────┘
                         ▲               │ retry w/ backoff,
                         │               │ then DLQ on exhaustion
                         │               ▼
                         │        ┌─────────────┐      ┌─────────────┐
                         └────────│ events.dlq  │─────▶│ DLQ Consumer│
-                                 │   (Kafka)   │      │  (audit log)│
-                                 └─────────────┘      └─────────────┘
+                          batched│   (Kafka)   │      │  (audit log)│
+                          write  └─────────────┘      └─────────────┘
 
   Prometheus scrapes /metrics on api + every consumer replica.
 ```
+
+**Write path, and why it's shaped this way:** the API does not write to
+Postgres — it only produces to Kafka and returns. The consumer is the sole
+writer, and it writes once per event, not three times: earlier versions of
+this service had the API insert a `pending` row, the consumer update it to
+`processing`, then update it again to `completed` — three sequential
+Postgres round trips in the critical path of every single event. That's
+gone. The consumer now also batches: it collects every outcome from one
+`getmany()` poll (up to 500 events) and writes them in a single
+`INSERT ... FROM unnest(...)` statement per outcome type (completed /
+dead-lettered), instead of one write per event. Same for the Redis
+idempotency check — one pipelined round trip per poll batch, not one per
+event. This is what actually moved the latency and throughput numbers below
+(see [Benchmarks](#benchmarks)); Kafka itself was never the bottleneck.
+
+The trade-off: `GET /events/{id}` is eventually consistent. Right after a
+`POST /events` returns 202, the event may not be queryable yet (404) until
+the consumer catches up - typically tens of milliseconds, but not
+instantaneous. That's a deliberate choice, not an oversight; a system
+tracking "pending" state for every in-flight event at real volume pays for
+it in write amplification on the one component (Postgres) least able to
+scale horizontally here.
 
 ## What's in here, mapped to the design goals
 
@@ -80,8 +104,10 @@ point where real business logic would go.
 
 ## Benchmarks
 
-Two separate, real measurements — reproduce them yourself before citing
-either number anywhere; both depend on the machine they're run on.
+Three separate, real measurements — reproduce them yourself before citing
+any of these numbers anywhere; all depend on the machine they're run on,
+and this is one laptop running Docker Desktop, not a real multi-node
+cluster (see [Honest limits](#honest-limits-of-this-testing) below).
 
 ### 1. Producer latency: sync baseline vs. the platform's async pipeline
 
@@ -105,28 +131,81 @@ Measured run (2,000 events, M4 MacBook Pro, local Docker Kafka):
 
 | | effective latency / event | throughput |
 |---|---|---|
-| Sync baseline (one `send_and_wait()` at a time) | 0.82 ms | 1,226 events/sec |
-| Async pipeline (batched, 100-way concurrent) | 0.18 ms | 5,651 events/sec |
+| Sync baseline (one `send_and_wait()` at a time) | 0.64 ms | 1,553 events/sec |
+| Async pipeline (batched, 100-way concurrent) | 0.13 ms | 7,695 events/sec |
 
-**Effective per-event latency reduction: 78.3%.**
+**Effective per-event latency reduction: 79.8%.**
 
-### 2. Full pipeline throughput (API → Kafka → consumer → Postgres)
+### 2. Full pipeline via the REST API — and a bottleneck I found in my own test tool
 
 `make load` (`scripts/generate_load.py`) drives real traffic through the
-public API end-to-end, with a single consumer replica and `SIMULATE_FAILURE_RATE=0.05`
-exercising the retry path live.
+public API end-to-end: 30,000 events, 3 consumer replicas, `SIMULATE_FAILURE_RATE=0.05`
+exercising the retry path live. Measured: **173 events/sec**, zero data loss
+(80,000/80,000 events landed in Postgres across this and an earlier run),
+zero growing backlog (Kafka consumer lag stayed under ~110 messages the
+entire run, checked via `kafka-consumer-groups.sh --describe`).
 
-Measured run (2,000 events, `docker compose up -d`, no scaling):
-- **355 events/sec sustained**, end-to-end, including the Postgres write —
-  extrapolates to **~30.7M events/day** on one consumer replica, well past
-  the 1M+/day target, before `docker compose up --scale consumer=3` is even
-  used to add more.
-- 109 of 2,000 events (~5.5%) hit a simulated transient failure and were
-  automatically retried and completed — 0 reached the DLQ at the default
-  5-attempt retry budget.
-- Separately verified the DLQ path itself by forcing 100% failure on one
-  event: it exhausted all 5 retries, was marked `dead_letter` in Postgres,
-  and was recorded in `dead_letter_log` by the DLQ consumer, as designed.
+That number is real, but it's not the pipeline's ceiling — it's
+`generate_load.py`'s ceiling. Consumer lag never grew during the run, which
+means the consumers were idle waiting on events, not the other way around:
+the bottleneck was a single Python process's `httpx.AsyncClient` making
+30,000 HTTP round trips, not Kafka, Postgres, or the consumers. Measurement
+#3 isolates the part that actually matters.
+
+### 3. Consumer pipeline capacity, isolated from the test tool
+
+`scripts/capacity_test.py` publishes directly to Kafka (same path the API's
+producer takes, minus the HTTP hop — so it's still exercising the real
+producer config), then waits for the 3-replica consumer group to fully
+drain the batch and computes throughput from Postgres's own `processed_at`
+timestamps (min/max across the batch), not wall-clock guesses.
+
+```bash
+docker compose up -d --build --scale consumer=3
+PYTHONPATH=. python3 scripts/capacity_test.py --total 50000 --concurrency 200
+```
+
+Measured run (50,000 events, 3 consumer replicas, 6 Kafka partitions):
+- Produced 50,000 events to Kafka in 3.64s (13,722/sec — the producer
+  alone; see benchmark #1 for why this isn't the pipeline number either).
+- **Consumer pipeline sustained 1,653 events/sec** end-to-end into
+  Postgres, measured over the full 50,000-event drain window.
+- **Extrapolated: ~142.8M events/day** — about 143x the 1M+/day target.
+- Verified afterward: consumer group lag was exactly 0 on all 6 partitions,
+  and Postgres held exactly 80,000 completed rows (30,000 from run #2 +
+  50,000 from this run) — no loss, nothing stuck.
+
+This is the number I'd actually stand behind for a "sustained throughput"
+claim: it isolates the pipeline (Kafka → 3 consumer replicas → batched
+Postgres writes) from any test client's own limits, and every event in it
+is independently verifiable in Postgres.
+
+### Horizontal scaling
+
+`KAFKA_NUM_PARTITIONS=6` on the broker means `docker compose up --scale
+consumer=N` for N up to 6 actually redistributes partitions across
+replicas — verified via `kafka-consumer-groups.sh --describe`: with 3
+replicas running, each held exactly 2 of the 6 partitions. A single
+partition can only be consumed by one consumer in a group at a time, so
+this was a real fix, not cosmetic — the very first version of this repo had
+only 1 partition, which meant scaling consumer replicas did nothing.
+
+### Honest limits of this testing
+
+- One machine, Docker Desktop, not a real multi-broker Kafka cluster, not
+  separate hardware for Postgres/Redis/Kafka. Numbers on real distributed
+  infrastructure (see [AWS deployment](#aws-deployment-optional-your-account-your-cost))
+  will differ in both directions — likely better sustained throughput with
+  dedicated resources, but also real network latency between services that
+  loopback networking here doesn't have.
+- "Sustained" here means a 30-second drain window, not a 24-hour run. The
+  methodology (throughput while consumer lag holds flat or hits zero) is
+  the standard way to validate a sustained-rate claim without literally
+  running for a day, but it's still a few tens of seconds, not endurance
+  testing.
+- `SIMULATE_FAILURE_RATE=0.05` is synthetic. Real failure modes (a slow
+  downstream dependency, a poison-pill message, a full disk) will behave
+  differently than a coin flip in `processor.py`.
 
 ## Fault tolerance in detail
 
@@ -202,7 +281,9 @@ src/
   db.py, redis_client.py, config.py, schemas.py, aws_integration.py
 scripts/
   benchmark.py           Producer latency/throughput A/B benchmark
-  generate_load.py       Realistic end-to-end load generator
+  generate_load.py       Realistic end-to-end load generator (via the REST API)
+  capacity_test.py       Consumer pipeline sustained-throughput test, isolated
+                          from the load generator's own limits
 infra/                   Terraform for the free-tier AWS deployment
 migrations/001_init.sql  Postgres schema
 ```

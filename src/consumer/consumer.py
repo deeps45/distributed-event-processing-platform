@@ -19,7 +19,7 @@ from src.monitoring.metrics import (
     PROCESSING_LATENCY_SECONDS,
 )
 from src.producer.producer import EventProducer
-from src.redis_client import mark_processed_if_new
+from src.redis_client import get_redis
 from src.schemas import Event
 
 configure_logging("consumer")
@@ -31,16 +31,32 @@ logger = logging.getLogger(__name__)
 CONCURRENCY = 20
 
 
-async def handle_message(event: Event, dlq_producer: EventProducer, semaphore: asyncio.Semaphore) -> None:
+async def check_idempotency_batch(events: list[Event]) -> list[bool]:
+    """One Redis round trip for the whole poll batch instead of one per
+    event: still an atomic SET NX per key (each command is independently
+    atomic), just pipelined so N events cost 1 network round trip, not N.
+    """
+    client = get_redis()
+    pipe = client.pipeline(transaction=False)
+    for event in events:
+        pipe.set(f"event:processed:{event.id}", "1", nx=True, ex=settings.idempotency_ttl_seconds)
+    results = await pipe.execute()
+    return [bool(r) for r in results]
+
+
+async def handle_message(
+    event: Event, is_new: bool, dlq_producer: EventProducer, semaphore: asyncio.Semaphore
+) -> dict | None:
+    """Processes one event and returns an outcome row for the batched DB
+    write the caller issues once per poll cycle - this function itself does
+    no DB I/O, which is what makes that batching possible.
+    """
     async with semaphore:
         IN_FLIGHT_EVENTS.inc()
         try:
-            is_new = await mark_processed_if_new(str(event.id))
             if not is_new:
                 EVENTS_DUPLICATE.labels(event_type=event.event_type).inc()
-                return
-
-            await db.mark_processing(event.id)
+                return None
 
             try:
                 await retry_with_backoff(
@@ -50,20 +66,36 @@ async def handle_message(event: Event, dlq_producer: EventProducer, semaphore: a
                 )
             except Exception as exc:
                 EVENTS_FAILED.labels(event_type=event.event_type).inc()
-                await db.mark_dead_letter(event.id, settings.max_retries, str(exc))
                 await dlq_producer.send_event(event, topic=settings.kafka_topic_dlq)
                 EVENTS_DEAD_LETTERED.labels(event_type=event.event_type).inc()
                 logger.error(
                     "event dead-lettered after exhausting retries",
                     extra={"event_id": str(event.id), "error": str(exc)},
                 )
-                return
+                return {
+                    "outcome": "dead_letter",
+                    "id": event.id,
+                    "event_type": event.event_type,
+                    "payload": event.payload,
+                    "source": event.source,
+                    "produced_at": event.produced_at,
+                    "retry_count": settings.max_retries,
+                    "error_message": str(exc),
+                }
 
             processed_at = datetime.now(timezone.utc)
-            await db.mark_completed(event.id, processed_at)
             latency = (processed_at - event.produced_at).total_seconds()
             PROCESSING_LATENCY_SECONDS.observe(latency)
             EVENTS_PROCESSED.labels(event_type=event.event_type).inc()
+            return {
+                "outcome": "completed",
+                "id": event.id,
+                "event_type": event.event_type,
+                "payload": event.payload,
+                "source": event.source,
+                "produced_at": event.produced_at,
+                "processed_at": processed_at,
+            }
         finally:
             IN_FLIGHT_EVENTS.dec()
 
@@ -97,18 +129,33 @@ async def run() -> None:
             if not batches:
                 continue
 
-            tasks = []
+            events: list[Event] = []
             for _tp, messages in batches.items():
                 for msg in messages:
                     try:
-                        event = Event.from_kafka_json(msg.value)
+                        events.append(Event.from_kafka_json(msg.value))
                     except Exception:
                         logger.exception("failed to parse message, skipping", extra={"offset": msg.offset})
-                        continue
-                    tasks.append(handle_message(event, dlq_producer, semaphore))
 
-            if tasks:
-                await asyncio.gather(*tasks)
+            if not events:
+                await consumer.commit()
+                continue
+
+            is_new_flags = await check_idempotency_batch(events)
+            outcomes = await asyncio.gather(
+                *(
+                    handle_message(event, is_new, dlq_producer, semaphore)
+                    for event, is_new in zip(events, is_new_flags)
+                )
+            )
+
+            completed_rows = [o for o in outcomes if o and o["outcome"] == "completed"]
+            dead_letter_rows = [o for o in outcomes if o and o["outcome"] == "dead_letter"]
+
+            # Two DB round trips total for this whole batch (of up to 500
+            # events), not one per event - see db.py for why.
+            await db.upsert_completed_batch(completed_rows)
+            await db.upsert_dead_letter_batch(dead_letter_rows)
 
             # Committed once per fetched batch, after every message in it has
             # either completed or been routed to the DLQ, so a crash never

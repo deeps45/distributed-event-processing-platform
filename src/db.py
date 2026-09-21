@@ -37,53 +37,68 @@ def get_pool() -> asyncpg.Pool:
     return _pool
 
 
-async def insert_pending_event(event_id: uuid.UUID, event_type: str, payload: dict, source: str, produced_at: datetime) -> None:
+async def upsert_completed_batch(rows: list[dict]) -> None:
+    """Writes an entire consumer poll batch's successful events in one round
+    trip via unnest(), instead of one UPDATE per event. This (plus dropping
+    the API's insert and the consumer's separate "processing" write - see
+    src/api/main.py and src/consumer/consumer.py) is what took the pipeline
+    from 3 sequential Postgres round trips per event down to a single
+    batched one, which is where nearly all of the latency and throughput
+    improvement over the first version of this service came from.
+
+    Each row: {id, event_type, payload, source, produced_at, processed_at}
+    """
+    if not rows:
+        return
     pool = get_pool()
     await pool.execute(
         """
-        INSERT INTO events (id, event_type, payload, source, status, produced_at)
-        VALUES ($1, $2, $3, $4, 'pending', $5)
-        ON CONFLICT (id) DO NOTHING
+        INSERT INTO events (id, event_type, payload, source, status, produced_at, processed_at)
+        SELECT id, event_type, payload::jsonb, source, 'completed', produced_at, processed_at
+        FROM unnest(
+            $1::uuid[], $2::text[], $3::text[], $4::text[], $5::timestamptz[], $6::timestamptz[]
+        ) AS t(id, event_type, payload, source, produced_at, processed_at)
+        ON CONFLICT (id) DO UPDATE SET
+            status = EXCLUDED.status,
+            processed_at = EXCLUDED.processed_at
         """,
-        event_id,
-        event_type,
-        payload,
-        source,
-        produced_at,
+        [r["id"] for r in rows],
+        [r["event_type"] for r in rows],
+        [json.dumps(r["payload"]) for r in rows],
+        [r["source"] for r in rows],
+        [r["produced_at"] for r in rows],
+        [r["processed_at"] for r in rows],
     )
 
 
-async def mark_processing(event_id: uuid.UUID) -> None:
-    pool = get_pool()
-    await pool.execute("UPDATE events SET status = 'processing' WHERE id = $1", event_id)
+async def upsert_dead_letter_batch(rows: list[dict]) -> None:
+    """Same batching as upsert_completed_batch, for events that exhausted
+    retries within this poll cycle.
 
-
-async def mark_completed(event_id: uuid.UUID, processed_at: datetime) -> None:
-    pool = get_pool()
-    await pool.execute(
-        "UPDATE events SET status = 'completed', processed_at = $2 WHERE id = $1",
-        event_id,
-        processed_at,
-    )
-
-
-async def mark_retrying(event_id: uuid.UUID, retry_count: int, error_message: str) -> None:
+    Each row: {id, event_type, payload, source, produced_at, retry_count, error_message}
+    """
+    if not rows:
+        return
     pool = get_pool()
     await pool.execute(
-        "UPDATE events SET status = 'retrying', retry_count = $2, error_message = $3 WHERE id = $1",
-        event_id,
-        retry_count,
-        error_message,
-    )
-
-
-async def mark_dead_letter(event_id: uuid.UUID, retry_count: int, error_message: str) -> None:
-    pool = get_pool()
-    await pool.execute(
-        "UPDATE events SET status = 'dead_letter', retry_count = $2, error_message = $3 WHERE id = $1",
-        event_id,
-        retry_count,
-        error_message,
+        """
+        INSERT INTO events (id, event_type, payload, source, status, produced_at, retry_count, error_message)
+        SELECT id, event_type, payload::jsonb, source, 'dead_letter', produced_at, retry_count, error_message
+        FROM unnest(
+            $1::uuid[], $2::text[], $3::text[], $4::text[], $5::timestamptz[], $6::int[], $7::text[]
+        ) AS t(id, event_type, payload, source, produced_at, retry_count, error_message)
+        ON CONFLICT (id) DO UPDATE SET
+            status = EXCLUDED.status,
+            retry_count = EXCLUDED.retry_count,
+            error_message = EXCLUDED.error_message
+        """,
+        [r["id"] for r in rows],
+        [r["event_type"] for r in rows],
+        [json.dumps(r["payload"]) for r in rows],
+        [r["source"] for r in rows],
+        [r["produced_at"] for r in rows],
+        [r["retry_count"] for r in rows],
+        [r["error_message"] for r in rows],
     )
 
 

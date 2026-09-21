@@ -34,8 +34,13 @@ app = FastAPI(title="Distributed Event Processing Platform", lifespan=lifespan)
 
 @app.post("/events", status_code=202)
 async def submit_event(event_in: EventIn):
+    # Deliberately no DB write here - the consumer is the sole writer (see
+    # src/consumer/consumer.py), so submitting an event costs one Kafka
+    # produce, not a produce plus a synchronous Postgres round trip. The
+    # trade-off: this is eventually consistent. A GET immediately after
+    # this call can 404 until the consumer catches up (typically low tens
+    # of ms) - see get_event() below.
     event = Event(**event_in.model_dump())
-    await db.insert_pending_event(event.id, event.event_type, event.payload, event.source, event.produced_at)
     await producer.send_event(event)
     EVENTS_PRODUCED.labels(event_type=event.event_type).inc()
     return {"id": str(event.id), "status": "accepted"}
@@ -43,6 +48,9 @@ async def submit_event(event_in: EventIn):
 
 @app.get("/events/{event_id}")
 async def get_event(event_id: str):
+    """May 404 for an event that was just submitted and hasn't been
+    processed yet - see the note on submit_event(). Poll if you need to
+    wait for a terminal status."""
     try:
         parsed_id = uuid.UUID(event_id)
     except ValueError:
@@ -50,7 +58,7 @@ async def get_event(event_id: str):
 
     row = await db.get_event(parsed_id)
     if row is None:
-        raise HTTPException(status_code=404, detail="event not found")
+        raise HTTPException(status_code=404, detail="event not found or not yet processed")
     return dict(row)
 
 
